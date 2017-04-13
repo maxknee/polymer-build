@@ -32,9 +32,19 @@ Check out the [custom-build generator](https://github.com/PolymerElements/genera
 
 `PolymerProject` represents your project in the build pipeline. Once configured, it will give you access to a collection of streams and helpers for building your project.
 
-To create a new instance of PolymerProject, you'll need to give it some information about your project. See the [`ProjectOptions`](src/polymer-project.ts) definition for a full list of all supported options.
+To create a new instance of `PolymerProject`, you'll need to give it some information about your application. If you already have a [`polymer.json`](https://www.polymer-project.org/1.0/docs/tools/polymer-cli#build) configuration file in your project, you can create a new `PolymerProject` instance by loading it directly:
 
 ```js
+const PolymerProject = require('polymer-build').PolymerProject;
+
+const project = new PolymerProject(require('./polymer.json'));
+```
+
+Or, you can pass in configuration options directly to the `PolymerProject` constructor:
+
+```js
+const PolymerProject = require('polymer-build').PolymerProject;
+
 const project = new PolymerProject({
   entrypoint: 'index.html',
   shell: 'src/my-app.html',
@@ -46,42 +56,56 @@ const project = new PolymerProject({
 });
 ```
 
-> **NOTE:** If you've previously used the Polymer CLI to build your project, these options are the same information that's held in your project's `polymer.json` file. If you prefer, you can continue to store these values in that file and then load them here.
-
-> ```js
-const project = new PolymerProject(require('./polymer.json'));
-```
-
 #### project.sources()
 
-Returns a readable stream of your project's source files. By default, these are the files in your project's `src/` directory, but if you have additional source files this can be configured via the `sourceGlobs` property in [`ProjectOptions`](src/polymer-project.ts).
+Returns a readable stream of your project's source files. By default, these are the files in your project's `src/` directory, but if you have additional source files this can be configured via the `sources` property in [`ProjectOptions`](src/polymer-project.ts).
 
 #### project.dependencies()
 
-Returns a readable stream of your project's dependencies. This stream is automatically populated based on the files loaded inside of your project. You can include additional dependencies via the `includeDependencies` property in [`ProjectOptions`](src/polymer-project.ts) (this can be useful when the analyzer fails to detect a necessary dependency.)
-
-#### project.analyzer
-
-A stream that analyzes your project as files pass through it. Files pass through it untouched (although they may exit in a different order than they entered). The analyzer enables a lot of the more powerful features of polymer-build, like smart dependency analysis & bundling.
-
-**polymer.analyzer is a required step in your build-pipeline!** Be sure to pipe all files through it before piping out to your build destination(s). If dependencies aren't piped to `project.analyzer` the analyzer will hang.
+Returns a readable stream of your project's dependencies. This stream is automatically populated based on the files loaded inside of your project. You can include additional dependencies via the `extraDependencies` property in [`ProjectOptions`](src/polymer-project.ts) (this can be useful when the analyzer fails to detect a necessary dependency.)
 
 ```js
 const gulp = require('gulp');
 const mergeStream = require('merge-stream');
 
-// pipe both streams
+// Create a build pipeline to pipe both streams together to the 'build/' dir
 mergeStream(project.sources(), project.dependencies())
-  .pipe(project.analyzer)
   .pipe(gulp.dest('build/'));
 ```
 
 
+### Handling Inlined CSS/JS
+
+#### HtmlSplitter
+
+Web components will sometimes include inlined CSS & JavaScript. This can pose a problem for tools that weren't built to read those languages from inside HTML. To solve this, you can create an `HtmlSplitter` instance to extract inlined CSS & JavaScript into individual files in your build stream for processing (and then rejoin them later).
+
+```js
+const gulpif = require('gulp-if');
+const uglify = require('gulp-uglify');
+const cssSlam = require('css-slam').gulp;
+const htmlMinifier = require('gulp-html-minifier');
+const HtmlSplitter = require('polymer-build').HtmlSplitter;
+
+const sourcesHtmlSplitter = new HtmlSplitter();
+const sourcesStream = project.sources()
+  .pipe(sourcesHtmlSplitter.split()) // split inline JS & CSS out into individual .js & .css files
+  .pipe(gulpif(/\.js$/, uglify()))
+  .pipe(gulpif(/\.css$/, cssSlam()))
+  .pipe(gulpif(/\.html$/, htmlMinifier()))
+  .pipe(sourcesHtmlSplitter.rejoin()); // rejoins those files back into their original location
+
+// NOTE: If you want to split/rejoin your dependencies stream as well, you'll need to create a new HtmlSplitter for that stream.
+```
+
+You can add splitters to any part of your build stream. We recommend using them to optimize your `sources()` and `dependencies()` streams individually as in the example above, but you can also optimize after merging the two together or even after bundling.
+
+
 ### Bundling Files
 
-#### project.bundler
+#### project.bundler()
 
-A stream that combines the files in your application to reduce the number of frontend requests needed. This can be a great way to [improve performance](https://developer.yahoo.com/performance/rules.html#num_http) when HTTP2/Push is not available.
+A stream that combines seperate files into code bundles based on your application's dependency graph. This can be a great way to [improve performance](https://developer.yahoo.com/performance/rules.html#num_http) by reducing the number of frontend requests needed.
 
 By default, the bundler will create one "shared-bundle.html" containing all shared dependencies. You can optimize even further by defining "fragments" in your project options. Fragments are lazy loaded parts of the application, typically views and other elements loaded on-demand. When fragments are defined, the bundler is able to create smaller bundles containing code that is only required for specific fragments.
 
@@ -89,53 +113,18 @@ By default, the bundler will create one "shared-bundle.html" containing all shar
 const gulp = require('gulp');
 const mergeStream = require('merge-stream');
 
-// pipe both streams
+// Create a build pipeline to bundle our application before writing to the 'build/' dir
 mergeStream(project.sources(), project.dependencies())
-  .pipe(project.analyzer)
-  .pipe(project.bundler)
+  .pipe(project.bundler())
   .pipe(gulp.dest('build/'));
 ```
 
 
-### Extracting Inlined CSS/JS
-
-#### project.splitHtml() & project.rejoinHtml()
-
-Web components will sometimes include inlined CSS & JavaScript. This can be a problem for tools that weren't built to read HTML. To get around this, you can include the optional `splitHtml()` and `rejoinHtml()` streams.
-
-`project.splitHtml()` returns a stream that extracts any inlined CSS & JS into individual files. This can be useful for running your files through additional tools that don't handle inline code very well.
-
-Note that this should be a temporary part of your overall build pipeline. Split files should always be rejoined with `project.rejoinHtml()` as soon as possible in the pipeline.
-
-```js
-const gulpif = require('gulp-if');
-const uglify = require('gulp-uglify');
-const cssSlam = require('css-slam').gulp;
-const htmlMinifier = require('gulp-html-minifier');
-const mergeStream = require('merge-stream');
-
-const sourcesStream = polymerProject.sources()
-  .pipe(polymerProject.splitHtml())
-  .pipe(gulpif(/\.js$/, uglify()))
-  .pipe(gulpif(/\.css$/, cssSlam()))
-  .pipe(gulpif(/\.html$/, htmlMinifier()))
-  .pipe(polymerProject.rejoinHtml());
-
-// not shown: project.dependencies() can also be split & optimized
-
-mergeStream(sourcesStream, project.dependencies())
-  .pipe(project.analyzer)
-  .pipe(gulp.dest('build/'));
-```
-
-
-### Generating Service Workers
+### Generating a Service Worker
 
 #### generateServiceWorker()
 
 `generateServiceWorker()` will generate the service worker code based on your build. Unlike other parts of polymer-build, `generateServiceWorker()` returns a promise and not a stream. It can only be run **after** your build has finished writing to disk, so that it is able to analyze the entire build as it exists.
-
-`generateServiceWorker()` is built on top of the [sw-precache](https://github.com/GoogleChrome/sw-precache) library. Any options it supports can be passed directly to that library via the `swConfig` option.
 
 For bundled builds, be sure to set the bundled option to `true`. See [AddServiceWorkerOptions](src/service-worker.ts) for a list of all supported options.
 
@@ -144,26 +133,53 @@ const generateServiceWorker = require('polymer-build').generateServiceWorker;
 
 generateServiceWorker({
   buildRoot: 'build/',
-  project: polymerProject,
-  bundled: true // set if `polymerProject.bundler` was used
-  swConfig: {
-    // See https://github.com/GoogleChrome/sw-precache for all supported options
+  project: project,
+  bundled: true, // set if `project.bundler()` was used
+  swPrecacheConfig: {
+    // See https://github.com/GoogleChrome/sw-precache#options-parameter for all supported options
     navigateFallback: '/index.html',
   }
 }).then(() => { // ...
 ```
 
+`generateServiceWorker()` is built on top of the [sw-precache](https://github.com/GoogleChrome/sw-precache) library. Any options it supports can be passed directly to that library via the `swPrecacheConfig` option. See [sw-preache](https://github.com/GoogleChrome/sw-precache#options-parameter) for a list of all supported options
+
+In some cases you may need to whitelist 3rd party services with sw-precache, so the Service Worker doesn't intercept them. For instance, if you're hosting your app on Firebase, you'll want to add the `navigateFallbackWhitelist: [/^(?!\/__)/]` option to your `swPrecacheConfig` as Firebase owns the `__` namespace, and intercepting it will cause things like OAuth to fail.
+
 #### addServiceWorker()
 
-Like `generateServiceWorker()`, but writes the generated service worker to the file path you specify in the `serviceWorkerPath` option ("service-worker.js" by default).
+Like `generateServiceWorker()`, but writes the generated service worker to the file path you specify in the `path` option ("service-worker.js" by default).
 
 ```js
 const addServiceWorker = require('polymer-build').addServiceWorker;
 
 addServiceWorker({
   buildRoot: 'build/',
-  project: polymerProject,
+  project: project,
 }).then(() => { // ...
+```
+
+
+### Generating an HTTP/2 Push Manifest
+
+`polymer-build` can automatically generate a [push manifest](https://github.com/GoogleChrome/http2-push-manifest) for your application. This JSON file can be read by any HTTP/2 push-enabled web server to more easily construct the appropriate `Link: <URL>; rel=preload; as=<TYPE>` headers(s) for HTTP/2 push/preload. Check out [http2push-gae](https://github.com/GoogleChrome/http2push-gae) for an example Google Apps Engine server that supports this.
+
+The generated push manifest describes the following behavior: Requesting the shell should push any shell dependencies as well. Requesting a fragment should push any dependencies of that fragment *that were not already pushed by the shell.* If no shell was defined for your build, `polymer-build` will use the application entrypoint URL instead (default: `index.html`).
+
+
+#### project.addPushManifest()
+
+This method will return a transform stream that injects a new push manifest into your build (default: `push-manifest.json`). The push manifest is based off the application import graph, so make sure that this stream is added after all changes to the application source code.
+
+It optionally takes a `filePath` argument (relative to your application root) to configure the name of the generated file.
+
+```js
+const gulp = require('gulp');
+const mergeStream = require('merge-stream');
+
+mergeStream(project.sources(), project.dependencies())
+  .pipe(project.addPushManifest())
+  .pipe(gulp.dest('build/'));
 ```
 
 
@@ -174,18 +190,21 @@ addServiceWorker({
 Sometimes you'll want to pipe a build to multiple destinations. `forkStream()` creates a new stream that copies the original stream, cloning all files that pass through it.
 
 ```js
+const gulp = require('gulp');
 const mergeStream = require('merge-stream');
 const forkStream = require('polymer-build').forkStream;
 
-const buildStream = mergeStream(project.sources(), project.dependencies())
-  .pipe(project.analyzer);
+// Create a combined build stream of your application files
+const buildStream = mergeStream(project.sources(), project.dependencies());
 
+// Fork your build stream to write directly to the 'build/unbundled' dir
 const unbundledBuildStream = forkStream(buildStream)
-  .pipe(dest('build/unbundled'));
+  .pipe(gulp.dest('build/unbundled'));
 
+// Fork your build stream to bundle your application and write to the 'build/bundled' dir
 const bundledBuildStream = forkStream(buildStream)
-  .pipe(polymerProject.bundler)
-  .pipe(dest('build/bundled'));
+  .pipe(project.bundler())
+  .pipe(gulp.dest('build/bundled'));
 ```
 
 
@@ -203,4 +222,3 @@ You can compile polymer-build from source by cloning the repo and then running `
 ## Supported Node.js Versions
 
 polymer-build officially supports the latest LTS (4.x) and stable (6.x) versions of Node.js.
-
